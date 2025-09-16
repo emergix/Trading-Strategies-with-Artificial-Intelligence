@@ -98,5 +98,5 @@ Mon approche vise à être **antifragile** :
 En résumé :  
 **Croissance, stabilité, spéculation** → trois poches cohérentes, reliées par une discipline quantitative et une flexibilité pratique.
 
-📄 **Formalisation mathematique**: [Trading_Strategies](./papiers/Trading_Strategies.pdf)
+📄 **Formalisation Mathematique**: [Trading_Strategies](./papiers/Trading_Strategies.pdf)
 
