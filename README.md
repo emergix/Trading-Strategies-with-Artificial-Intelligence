@@ -97,3 +97,6 @@ Mon approche vise à être **antifragile** :
 
 En résumé :  
 **Croissance, stabilité, spéculation** → trois poches cohérentes, reliées par une discipline quantitative et une flexibilité pratique.
+
+📄 **Formalisation De la notion de creation**: [Trading_Strategies](./Trading_Strategies.pdf)
+
