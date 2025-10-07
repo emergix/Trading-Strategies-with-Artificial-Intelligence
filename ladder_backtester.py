@@ -117,22 +117,22 @@ def backtest_ladder_strategy(
     config: LadderConfig,
     ref_init: Optional[float] = None,
     rf_annual: float = 0.0,
+    *,
+    # flags
+    plot_price: bool = True,
+    plot_equity: bool = True,
+    plot_cash: bool = False,
+    plot_portfolio: bool = False,
+    record_trades: bool = True,
+    record_journal: bool = True,
+    compute_metrics: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Backtest a daily ladder-style buy/sell strategy between t1 and t2.
-    df: DataFrame with ['Date','Close'] or DatetimeIndex + 'Close'.
-    t1,t2: date strings or pd.Timestamp.
-    initial_cash: starting cash.
-    config: LadderConfig.
-    ref_init: initial reference price (if None, uses first close in window).
-    rf_annual: annual risk-free used for Sharpe/Sortino.
-    """
     px = ensure_datetime_index(df)[["Close"]].copy()
     px = px.loc[(px.index >= pd.to_datetime(t1)) & (px.index <= pd.to_datetime(t2))].copy()
     if px.empty:
         raise ValueError("No data in the selected [t1, t2] window.")
 
-    # Reference initialization
+    # init ref
     if config.reference_mode in ("peak", "trailing_max"):
         ref = ref_init if ref_init is not None else float(px["Close"].iloc[0])
     elif config.reference_mode == "rolling_mean":
@@ -144,34 +144,30 @@ def backtest_ladder_strategy(
     else:
         raise ValueError("Invalid reference_mode.")
 
-    # State
+    # state
     cash = float(initial_cash)
     units = 0.0
-    equity_curve = []
-    position_values = []
-    cash_series = []
-    ref_series = []
-    trades: List[Dict[str, Any]] = []
+    equity_curve, position_values, cash_series, ref_series = [], [], [], []
+    trades: List[Dict[str, Any]] = [] if record_trades else None
 
-    # Sort ladders: buys from largest drop to smallest, sells from smallest rise to largest
+    # order ladders
     buy_levels = sorted(config.buy_levels, reverse=True)
-    buy_sizes = [s for _, s in sorted(zip(config.buy_levels, config.buy_sizes), reverse=True)]
+    buy_sizes  = [s for _, s in sorted(zip(config.buy_levels, config.buy_sizes), reverse=True)]
     sell_levels = sorted(config.sell_levels)
-    sell_sizes = [s for _, s in sorted(zip(config.sell_levels, config.sell_sizes))]
+    sell_sizes  = [s for _, s in sorted(zip(config.sell_levels, config.sell_sizes))]
 
     for date, row in px.iterrows():
         price = float(row["Close"])
 
-        # Update reference
+        # update reference
         if config.reference_mode in ("peak", "trailing_max"):
             ref = max(ref, price)
         elif config.reference_mode == "rolling_mean":
             start_idx = max(0, px.index.get_loc(date) - config.rolling_window + 1)
             ref = float(px["Close"].iloc[start_idx: px.index.get_loc(date) + 1].mean())
-        elif config.reference_mode == "anchored":
-            pass  # keep initial anchor unless changed externally
+        # anchored: keep ref
 
-        # --- BUY ladder ---
+        # buys
         for lvl, frac_cash in zip(buy_levels, buy_sizes):
             threshold = ref * (1.0 - float(lvl))
             if price <= threshold and cash > 0:
@@ -180,34 +176,36 @@ def backtest_ladder_strategy(
                 current_position_value = units * price
                 buy_value = min(frac_cash * cash, max(0.0, target_position_value - current_position_value))
                 if buy_value > 0:
-                    fee = buy_value * (config.fee_bps / 1e4)
+                    fee  = buy_value * (config.fee_bps / 1e4)
                     slip = buy_value * (config.slippage_bps / 1e4)
                     effective_value = buy_value - fee - slip
                     delta_units = effective_value / price
                     units += delta_units
-                    cash -= buy_value
-                    trades.append({
-                        "Date": date, "Side": "BUY", "Price": price, "Ref": ref,
-                        "Level": -float(lvl), "CashUsed": buy_value, "UnitsDelta": delta_units
-                    })
+                    cash  -= buy_value
+                    if record_trades:
+                        trades.append({
+                            "Date": date, "Side": "BUY", "Price": price, "Ref": ref,
+                            "Level": -float(lvl), "CashUsed": buy_value, "UnitsDelta": delta_units
+                        })
                     if not config.allow_multiple_triggers_per_day:
                         break
 
-        # --- SELL ladder ---
+        # sells
         for lvl, frac_pos in zip(sell_levels, sell_sizes):
             threshold = ref * (1.0 + float(lvl))
             if price >= threshold and units > 0:
                 sell_units = frac_pos * units
                 sell_value = sell_units * price
-                fee = sell_value * (config.fee_bps / 1e4)
+                fee  = sell_value * (config.fee_bps / 1e4)
                 slip = sell_value * (config.slippage_bps / 1e4)
                 net_value = sell_value - fee - slip
                 units -= sell_units
-                cash += net_value
-                trades.append({
-                    "Date": date, "Side": "SELL", "Price": price, "Ref": ref,
-                    "Level": +float(lvl), "CashReceived": net_value, "UnitsDelta": -sell_units
-                })
+                cash  += net_value
+                if record_trades:
+                    trades.append({
+                        "Date": date, "Side": "SELL", "Price": price, "Ref": ref,
+                        "Level": +float(lvl), "CashReceived": net_value, "UnitsDelta": -sell_units
+                    })
                 if not config.allow_multiple_triggers_per_day:
                     break
 
@@ -217,71 +215,94 @@ def backtest_ladder_strategy(
         cash_series.append((date, cash))
         ref_series.append((date, ref))
 
-    equity_series = pd.Series(data=[v for _, v in equity_curve],
-                              index=[d for d, _ in equity_curve], name="Equity")
-    pos_series = pd.Series(data=[v for _, v in position_values],
-                           index=[d for d, _ in position_values], name="PositionValue")
-    cash_series = pd.Series(data=[v for _, v in cash_series],
-                            index=[d for d, _ in cash_series], name="Cash")
-    ref_series = pd.Series(data=[v for _, v in ref_series],
-                           index=[d for d, _ in ref_series], name="Reference")
+    # series
+    equity_series = pd.Series([v for _, v in equity_curve], index=[d for d, _ in equity_curve], name="Equity")
+    pos_series    = pd.Series([v for _, v in position_values], index=[d for d, _ in position_values], name="PositionValue")
+    cash_series   = pd.Series([v for _, v in cash_series], index=[d for d, _ in cash_series], name="Cash")
+    ref_series    = pd.Series([v for _, v in ref_series], index=[d for d, _ in ref_series], name="Reference")
 
-    rets = equity_series.pct_change().fillna(0.0)
+    # plots
+    import matplotlib.pyplot as plt
+    if plot_price:
+        plt.figure(figsize=(12,4))
+        plt.plot(px.index, px["Close"])
+        plt.title("Underlying Price")
+        plt.xlabel("Date"); plt.ylabel("Price")
+        plt.tight_layout(); plt.show()
 
-    mdd, peak_date, trough_date = max_drawdown(equity_series)
-    def _calmar(eq): 
-        try: 
-            return calmar_ratio(eq)
-        except Exception:
-            return np.nan
+    if plot_equity:
+        plt.figure(figsize=(12,4))
+        plt.plot(equity_series.index, equity_series.values)
+        plt.title("Equity Curve")
+        plt.xlabel("Date"); plt.ylabel("Equity")
+        plt.tight_layout(); plt.show()
 
-    metrics = {
-        "StartDate": equity_series.index[0],
-        "EndDate": equity_series.index[-1],
-        "StartEquity": float(equity_series.iloc[0]),
-        "EndEquity": float(equity_series.iloc[-1]),
-        "PnL": float(equity_series.iloc[-1] - equity_series.iloc[0]),
-        "CAGR": float(cagr(equity_series)),
-        "Sharpe": float(sharpe_ratio(rets, rf=rf_annual)),
-        "Sortino": float(sortino_ratio(rets, rf=rf_annual)),
-        "MaxDrawdown": float(mdd),
-        "MDD_PeakDate": peak_date,
-        "MDD_TroughDate": trough_date,
-        "Calmar": float(_calmar(equity_series)),
-        "Trades": len(trades),
-        "FinalCash": float(cash_series.iloc[-1]),
-        "FinalUnitsValue": float(pos_series.iloc[-1]),
-        "FinalUnits": float((pos_series.iloc[-1] / px["Close"].iloc[-1]) if px["Close"].iloc[-1] != 0 else 0.0),
-        "ExposurePctAvg": float((pos_series / equity_series).replace([np.inf, -np.inf], np.nan).fillna(0).mean())
-    }
+    if plot_cash:
+        plt.figure(figsize=(12,4))
+        plt.plot(cash_series.index, cash_series.values, color="orange")
+        plt.title("Cash Remaining")
+        plt.xlabel("Date"); plt.ylabel("Cash")
+        plt.tight_layout(); plt.show()
 
-    trades_df = pd.DataFrame(trades)
-    metrics_df = pd.DataFrame([metrics])
+    if plot_portfolio:
+        plt.figure(figsize=(12,4))
+        plt.plot(equity_series.index, equity_series.values, label="Equity")
+        plt.plot(pos_series.index, pos_series.values, label="Position Value")
+        plt.plot(cash_series.index, cash_series.values, label="Cash")
+        plt.legend()
+        plt.title("Portfolio Breakdown")
+        plt.xlabel("Date"); plt.ylabel("Value")
+        plt.tight_layout(); plt.show()
 
-    # Plots (optional)
-    plt.figure(figsize=(12, 4))
-    plt.plot(px.index, px["Close"])
-    plt.title("Underlying Price")
-    plt.xlabel("Date")
-    plt.ylabel("Price")
-    plt.tight_layout()
-    plt.show()
+    # metrics
+    metrics_df = None
+    if compute_metrics:
+        rets = equity_series.pct_change().fillna(0.0)
+        mdd, peak_date, trough_date = max_drawdown(equity_series)
+        metrics = {
+            "StartDate": equity_series.index[0],
+            "EndDate": equity_series.index[-1],
+            "StartEquity": float(equity_series.iloc[0]),
+            "EndEquity": float(equity_series.iloc[-1]),
+            "PnL": float(equity_series.iloc[-1] - equity_series.iloc[0]),
+            "CAGR": float(cagr(equity_series)),
+            "Sharpe": float(sharpe_ratio(rets, rf=rf_annual)),
+            "Sortino": float(sortino_ratio(rets, rf=rf_annual)),
+            "MaxDrawdown": float(mdd),
+            "MDD_PeakDate": peak_date,
+            "MDD_TroughDate": trough_date,
+            "Calmar": float(calmar_ratio(equity_series)),
+            "Trades": int(len(trades) if record_trades else 0),
+            "FinalCash": float(cash_series.iloc[-1]),
+            "FinalUnitsValue": float(pos_series.iloc[-1]),
+            "FinalUnits": float((pos_series.iloc[-1] / px["Close"].iloc[-1]) if px["Close"].iloc[-1] != 0 else 0.0),
+            "ExposurePctAvg": float((pos_series / equity_series).replace([np.inf, -np.inf], np.nan).fillna(0).mean())
+        }
+        metrics_df = pd.DataFrame([metrics])
 
-    plt.figure(figsize=(12, 4))
-    plt.plot(equity_series.index, equity_series.values)
-    plt.title("Equity Curve")
-    plt.xlabel("Date")
-    plt.ylabel("Equity")
-    plt.tight_layout()
-    plt.show()
+    # journal
+    journal = None
+    if record_journal:
+        journal = (
+            pd.concat(
+                [equity_series.rename("Equity"),
+                 cash_series.rename("Cash"),
+                 pos_series.rename("PositionValue"),
+                 ref_series.rename("Reference")],
+                axis=1
+            )
+            .reset_index()
+            .rename(columns={"index": "Date"})
+        )
 
     return {
         "equity": equity_series,
         "cash": cash_series,
         "position_value": pos_series,
         "reference": ref_series,
-        "trades": trades_df,
+        "trades": (pd.DataFrame(trades) if record_trades else None),
         "metrics": metrics_df,
+        "journal": journal,
     }
 
 
